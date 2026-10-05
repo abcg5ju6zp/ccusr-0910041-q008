@@ -39,6 +39,11 @@ DEFAULT_CONFIG = {
     "FORWARDED_SECRET": None,  # nosec B105
     "GRACEFUL_SHUTDOWN_TIMEOUT": 15.0,
     "GRACEFUL_TCP_CLOSE_TIMEOUT": 5.0,
+    # 软截止后，给已收到取消信号的在途工作离开进程的时间；
+    # 超过后仍未离开的租约会被强制执行（如 abort 传输层）。
+    "DRAIN_CANCEL_TIMEOUT": 5.0,
+    # 硬截止后用于区分“合作取消但收尾稍慢”与“无视取消”的沉降窗口。
+    "DRAIN_SETTLE_TIMEOUT": 0.25,
     "INSPECTOR": False,
     "INSPECTOR_HOST": "localhost",
     "INSPECTOR_PORT": 6457,
@@ -106,6 +111,8 @@ class Config(dict, metaclass=DescriptorMeta):
     FORWARDED_SECRET: str | None
     GRACEFUL_SHUTDOWN_TIMEOUT: float
     GRACEFUL_TCP_CLOSE_TIMEOUT: float
+    DRAIN_CANCEL_TIMEOUT: float
+    DRAIN_SETTLE_TIMEOUT: float
     INSPECTOR: bool
     INSPECTOR_HOST: str
     INSPECTOR_PORT: int

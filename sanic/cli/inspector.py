@@ -77,6 +77,22 @@ def make_inspector_parser(parser: ArgumentParser) -> None:
         help="Shutdown the application and all processes",
         formatter_class=SanicHelpFormatter,
     )
+    drain = subparsers.add_parser(
+        "drain",
+        help=(
+            "Show the in-process drain status of each worker; pass "
+            "--trigger to merge a graceful stop into any drain in progress"
+        ),
+        formatter_class=SanicHelpFormatter,
+    )
+    drain.add_argument(
+        "--trigger",
+        action="store_true",
+        help=(
+            "Trigger a drain (graceful stop) in addition to reporting "
+            "the status; repeated calls merge into the single drain"
+        ),
+    )
     scale = subparsers.add_parser(
         "scale",
         help="Scale the number of workers",

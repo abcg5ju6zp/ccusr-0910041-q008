@@ -11,6 +11,7 @@ from asyncio import CancelledError, sleep
 from time import perf_counter
 
 from sanic.compat import Header
+from sanic.drain.constants import LeaseOutcome, LeaseVerdict
 from sanic.exceptions import (
     BadRequest,
     ExpectationFailed,
@@ -110,14 +111,40 @@ class Http(Stream, metaclass=TouchUpMeta):
                 self.stage = Stage.HANDLER
                 self.perft0 = perf_counter()
                 self.request.conn_info = self.protocol.conn_info
-                await self.protocol.request_handler(self.request)
 
-                # Handler finished, response should've been sent
-                if self.stage is Stage.HANDLER and not self.upgrade_websocket:
-                    raise ServerError("Handler produced no response")
+                # 请求租约：覆盖处理器执行与响应（含流式）发送。
+                # 排空期间已 accept 的请求仍允许登记；终态拒绝则直接离开。
+                lease = self.protocol.admit_request_lease(self.request)
+                if lease is None:
+                    self.keep_alive = False
+                    return
+                try:
+                    await self.protocol.request_handler(self.request)
 
-                if self.stage is Stage.RESPONSE:
-                    await self.response.send(end_stream=True)
+                    # Handler finished, response should've been sent
+                    if (
+                        self.stage is Stage.HANDLER
+                        and not self.upgrade_websocket
+                    ):
+                        raise ServerError("Handler produced no response")
+
+                    if self.stage is Stage.RESPONSE:
+                        await self.response.send(end_stream=True)
+                except BaseException:
+                    # 任何离场（取消/错误）都先归还租约；具体响应由
+                    # 下面的 except 分支处理。只有协调器已对该租约
+                    # 裁决取消才记为 CANCELLED；客户端断连等其他原因
+                    # （verdict 仍为 None）记为正常离场。
+                    if lease.active:
+                        lease.release(
+                            LeaseOutcome.CANCELLED
+                            if lease.verdict is LeaseVerdict.CANCEL
+                            else LeaseOutcome.COMPLETED
+                        )
+                    raise
+                else:
+                    if lease.active:
+                        lease.release()
             except CancelledError as exc:
                 # Write an appropriate response before exiting
                 if not self.protocol.transport:
@@ -361,6 +388,10 @@ class Http(Stream, metaclass=TouchUpMeta):
             self.log_response()
 
         await self._send(ret)
+        # 首个分块发送（HANDLER -> RESPONSE）时把租约改类为流式：
+        # 流式响应拥有独立的类别宽限与延期资格。
+        if not end_stream and self.stage is Stage.HANDLER:
+            self.protocol.mark_response_streaming()
         self.stage = Stage.IDLE if end_stream else Stage.RESPONSE
 
     def head_response_ignored(self, data: bytes, end_stream: bool) -> None:

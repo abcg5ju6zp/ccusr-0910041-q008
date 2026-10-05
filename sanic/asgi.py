@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import warnings
 
 from typing import TYPE_CHECKING
 
 from sanic.compat import Header
+from sanic.drain import LeaseOutcome, LeaseVerdict, WorkKind
 from sanic.exceptions import BadRequest, ServerError
 from sanic.helpers import Default
 from sanic.http import Stage
@@ -48,6 +50,7 @@ class Lifespan:
 
     async def startup(self) -> None:
         """项目内部接口说明。"""
+        self.sanic_app.drain_coordinator.reset()
         await self.sanic_app._startup()
         await self.sanic_app._server_event("init", "before")
         await self.sanic_app._server_event("init", "after")
@@ -61,8 +64,19 @@ class Lifespan:
 
     async def shutdown(self) -> None:
         """项目内部接口说明。"""
-        await self.sanic_app._server_event("shutdown", "before")
-        await self.sanic_app._server_event("shutdown", "after")
+        # ASGI 服务器在发送 lifespan.shutdown 前已停止投递新请求，
+        # 这里直接进入排空：先跑 before 监听器（失败隔离），再由
+        # 协调器按截止时间等待在途请求/任务，最后跑 after 监听器。
+        coordinator = self.sanic_app.drain_coordinator
+        coordinator.begin_drain("asgi")
+        await self.sanic_app._server_event_safe("shutdown", "before")
+        await coordinator.drain()
+        await self.sanic_app._server_event_safe("shutdown", "after")
+
+        # 生命周期顺序已完整走完，但仍按 ASGI 规范把监听器失败
+        # 上报为 lifespan.shutdown.failed。
+        if coordinator.listener_exception is not None:
+            raise coordinator.listener_exception
 
     async def __call__(self) -> None:
         while True:
@@ -202,6 +216,14 @@ class ASGIApp:
         response.stream, self.response = self, response
         return response
 
+    def _mark_streaming(self) -> None:
+        """首个流式分块：把请求租约改类为 STREAM。"""
+        lease = getattr(self, "work_lease", None)
+        if lease is not None and lease.active:
+            self.sanic_app.drain_coordinator.reclassify(
+                lease, WorkKind.STREAM, extendable=True
+            )
+
     async def send(self, data, end_stream):
         if self.stage is Stage.IDLE:
             if not end_stream or data:
@@ -212,6 +234,7 @@ class ASGIApp:
                 )
             return
         if self.response and self.stage is Stage.HANDLER:
+            # 首个响应分块：租约随后改类为流式，获得独立宽限与延期资格。
             await self.transport.send(
                 {
                     "type": "http.response.start",
@@ -222,6 +245,12 @@ class ASGIApp:
             response_body = getattr(self.response, "body", None)
             if response_body:
                 data = response_body + data if data else response_body
+        if (
+            not end_stream
+            and self.stage is Stage.HANDLER
+            and self.sanic_app._drain_coordinator is not None
+        ):
+            self._mark_streaming()
         self.stage = Stage.IDLE if end_stream else Stage.RESPONSE
         await self.transport.send(
             {
@@ -235,6 +264,18 @@ class ASGIApp:
 
     async def __call__(self) -> None:
         """项目内部接口说明。"""
+        coordinator = self.sanic_app.drain_coordinator
+        lease = coordinator.admit(
+            WorkKind.REQUEST,
+            name=f"{self.request.method} {self.request.path}",
+            # 绑定当前 ASGI 请求任务，软取消时该任务收到 CancelledError。
+            task=asyncio.current_task(),
+        )
+        self.work_lease = lease
+        if lease is None:
+            # 排空已进入终态：不再处理新请求。
+            self.stage = Stage.IDLE
+            return
         try:
             self.stage = Stage.HANDLER
             await self.sanic_app.handle_request(self.request)
@@ -243,3 +284,10 @@ class ASGIApp:
                 await self.sanic_app.handle_exception(self.request, e)
             except Exception as exc:
                 await self.sanic_app.handle_exception(self.request, exc, False)
+        finally:
+            if lease.active:
+                lease.release(
+                    LeaseOutcome.CANCELLED
+                    if lease.verdict is LeaseVerdict.CANCEL
+                    else LeaseOutcome.COMPLETED
+                )

@@ -43,6 +43,7 @@ from sanic.application.motd import MOTD
 from sanic.application.state import ApplicationServerInfo, Mode, ServerStage
 from sanic.base.meta import SanicMeta
 from sanic.compat import OS_IS_WINDOWS, StartMethod
+from sanic.drain import DrainStage
 from sanic.exceptions import ServerError, ServerKilled
 from sanic.helpers import Default, _default, is_atty
 from sanic.http.constants import HTTP
@@ -385,8 +386,42 @@ class StartupMixin(metaclass=SanicMeta):
             asyncio_server_kwargs=asyncio_server_kwargs, **server_settings
         )
 
+    def request_stop(
+        self,
+        *,
+        signal: int | None = None,
+        terminate: bool = False,
+        hard: bool = False,
+    ) -> None:
+        """请求一次排空停机（多个停止源合并为同一次排空）。
+
+        - 首次调用：记录停止源、推进协调器到 DRAINING，并停止事件循环，
+          使 worker 进入统一的排空 finally 流程；
+        - 排空期间再次调用（第二发信号）：仅升级为强制取消；
+        - 已是终态：幂等无操作。
+
+        这是 SIGINT/SIGTERM 与本地管理接口共用的入口。
+        """
+        coordinator = self.drain_coordinator
+        if coordinator.stage is DrainStage.IDLE:
+            coordinator.begin_drain("signal", hard=hard)
+        elif hard:
+            coordinator.begin_drain("signal", hard=True)
+
+        if terminate and hasattr(self, "multiplexer"):
+            self.multiplexer.terminate()
+
+        # 让 run_forever() 返回，进入 _run_server_forever 的排空流程。
+        # 排空已经开始后（finally 执行中）不再停止循环，否则会中断
+        # 正在驱动协调器的 run_until_complete。
+        if coordinator.stage is DrainStage.DRAINING and not hard:
+            if self.state.stage is not ServerStage.STOPPED:
+                get_event_loop().stop()
+
     def stop(self, terminate: bool = True, unregister: bool = False) -> None:
         """项目内部接口说明。"""
+        # 与统一停机路径合并来源，保证只排空一次。
+        self.drain_coordinator.begin_drain("api")
         if terminate and hasattr(self, "multiplexer"):
             self.multiplexer.terminate()
         if self.state.stage is not ServerStage.STOPPED:

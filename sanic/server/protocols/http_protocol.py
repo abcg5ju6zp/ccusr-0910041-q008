@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 from asyncio import CancelledError
 from time import monotonic as current_time
 
+from sanic.drain import WorkKind
 from sanic.exceptions import (
     RequestCancelled,
     RequestTimeout,
@@ -114,6 +115,7 @@ class HttpProtocol(HttpProtocolMixin, SanicProtocol, metaclass=TouchUpMeta):
         "_exception",
         "recv_buffer",
         "_callback_check_timeouts",
+        "work_lease",
     )
 
     def __init__(
@@ -141,6 +143,35 @@ class HttpProtocol(HttpProtocolMixin, SanicProtocol, metaclass=TouchUpMeta):
             self.state["requests_count"] = 0
         self._exception = None
         self._callback_check_timeouts = None
+        self.work_lease = None
+
+    def admit_request_lease(self, request=None):
+        """为即将执行的处理器登记请求租约。
+
+        注意：一个连接任务在 keep-alive 上会顺序处理多个请求，因此
+        租约不绑定连接任务本身，而是按请求登记/归还；软取消通过
+        取消连接任务让当前处理器看到 CancelledError，强制执行 abort。
+        终态返回 None，调用方应放弃处理。
+        """
+        name = "request"
+        if request is not None:
+            name = f"{request.method} {request.path}"
+        lease = self.app.drain_coordinator.admit(
+            WorkKind.REQUEST,
+            name=name,
+            on_cancel=lambda: self._task and self._task.cancel(),
+            on_force=self.abort,
+        )
+        self.work_lease = lease
+        return lease
+
+    def mark_response_streaming(self) -> None:
+        """响应进入流式阶段：租约改类为 STREAM 并允许延期。"""
+        lease = self.work_lease
+        if lease is not None and lease.active:
+            self.app.drain_coordinator.reclassify(
+                lease, WorkKind.STREAM, extendable=True
+            )
 
     async def connection_task(self):  # no cov
         """项目内部接口说明。"""

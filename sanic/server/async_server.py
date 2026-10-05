@@ -43,11 +43,11 @@ class AsyncioServer:
 
     def before_stop(self):
         """项目内部接口说明。"""
-        return self._server_event("shutdown", "before")
+        return self._server_event_safe("shutdown", "before")
 
     def after_stop(self):
         """项目内部接口说明。"""
-        return self._server_event("shutdown", "after")
+        return self._server_event_safe("shutdown", "after")
 
     def is_serving(self) -> bool:
         """项目内部接口说明。"""
@@ -100,6 +100,14 @@ class AsyncioServer:
                 "first running await server.startup()"
             )
         return self.app._server_event(concern, action, loop=self.loop)
+
+    def _server_event_safe(self, concern: str, action: str):
+        if not self.app.state.is_started:
+            raise SanicException(
+                "Cannot dispatch server event without "
+                "first running await server.startup()"
+            )
+        return self.app._server_event_safe(concern, action, loop=self.loop)
 
     def __await__(self):
         """项目内部接口说明。"""

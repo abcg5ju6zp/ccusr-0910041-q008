@@ -51,6 +51,7 @@ from sanic.blueprint_group import BlueprintGroup
 from sanic.blueprints import Blueprint
 from sanic.compat import OS_IS_WINDOWS, enable_windows_color_support
 from sanic.config import SANIC_PREFIX, Config
+from sanic.drain import DrainCoordinator, Lease, WorkKind
 from sanic.exceptions import (
     BadRequest,
     SanicException,
@@ -128,6 +129,7 @@ class Sanic(
         "_asgi_client",
         "_blueprint_order",
         "_delayed_tasks",
+        "_drain_coordinator",
         "_ext",
         "_future_commands",
         "_future_exceptions",
@@ -299,6 +301,7 @@ class Sanic(
         self._asgi_client: Any = None
         self._blueprint_order: list[Blueprint] = []
         self._delayed_tasks: list[str] = []
+        self._drain_coordinator: DrainCoordinator | None = None
         self._future_registry: FutureRegistry = FutureRegistry()
         self._inspector: Inspector | None = None
         self._manager: WorkerManager | None = None
@@ -1301,6 +1304,49 @@ class Sanic(
             await maybe_coro
 
     # -------------------------------------------------------------------- #
+    # Drain coordination
+    # -------------------------------------------------------------------- #
+
+    @property
+    def drain_coordinator(self) -> DrainCoordinator:
+        """进程内排空协调器（惰性创建，每进程一个）。"""
+        if self._drain_coordinator is None:
+            self._drain_coordinator = DrainCoordinator(
+                graceful_timeout=self.config.GRACEFUL_SHUTDOWN_TIMEOUT,
+                cancel_timeout=self.config.DRAIN_CANCEL_TIMEOUT,
+                settle_timeout=self.config.DRAIN_SETTLE_TIMEOUT,
+            )
+        return self._drain_coordinator
+
+    def begin_work_lease(
+        self,
+        kind: WorkKind,
+        *,
+        name: str = "",
+        task: Task | None = None,
+        deadline: float | None = None,
+        extendable: bool = False,
+        on_cancel: Callable[..., Any] | None = None,
+        on_force: Callable[..., Any] | None = None,
+    ) -> Lease | None:
+        """登记一份在途工作；排空已进入终态时返回 ``None``。"""
+        return self.drain_coordinator.admit(
+            kind,
+            name=name,
+            task=task,
+            deadline=deadline,
+            extendable=extendable,
+            on_cancel=on_cancel,
+            on_force=on_force,
+        )
+
+    def drain_status(self) -> dict[str, Any]:
+        """本地管理接口：当前排空状态快照。"""
+        if self._drain_coordinator is None:
+            return {"stage": "idle", "active_total": 0}
+        return self._drain_coordinator.status()
+
+    # -------------------------------------------------------------------- #
     # Task management
     # -------------------------------------------------------------------- #
 
@@ -1351,6 +1397,17 @@ class Sanic(
 
         if name and register:
             app._task_registry[name] = tsk
+
+        # 框架后台任务纳入排空租约体系（RunServer 是服务器自身的
+        # 驱动任务，不属于业务工作）。任务终局时租约自动归还。
+        if tsk.get_name() != "RunServer":
+            app.drain_coordinator.admit(
+                WorkKind.TASK,
+                name=name or tsk.get_name(),
+                task=tsk,
+                # 后台任务默认允许延期到其自身工作完成，由软/硬截止兜底。
+                extendable=True,
+            )
 
         return tsk
 
@@ -1777,6 +1834,59 @@ class Sanic(
                 "loop": loop,
             },
         )
+
+    async def _server_event_safe(
+        self,
+        concern: str,
+        action: str,
+        loop: AbstractEventLoop | None = None,
+    ) -> None:
+        """逐监听器隔离地派发停机事件。
+
+        与 :meth:`_server_event` 不同，单个监听器抛异常不会中断其余
+        监听器，也不会破坏排空的生命周期顺序：异常被记录进协调器，
+        可通过本地管理接口查询，并继续执行下一个监听器。
+        """
+        event = f"server.{concern}.{action}"
+        try:
+            group, _handlers, params = self.signal_router.get(event)
+        except NotFound:
+            return
+
+        context = {"app": self, "loop": loop or self.loop}
+        routes = list(group.routes)
+        # 与 SignalRouter._dispatch 一致：init 事件反转路由顺序，
+        # shutdown 保持注册顺序。
+        if concern != "shutdown":
+            routes.reverse()
+
+        for signal in routes:
+            # 与 SignalRouter._dispatch 保持一致：shutdown.before/after
+            # 共享同一个路由 group，必须按信号定义与条件过滤，否则一次
+            # 派代会把另一个阶段（或不同 condition）的监听器也执行掉。
+            requirements = signal.extra.requirements
+            matches = signal.ctx.exclusive is False or not requirements
+            if not matches or not (
+                signal.ctx.trigger or event == signal.ctx.definition
+            ):
+                continue
+            call_params = dict(params)
+            call_params.update(context)
+            call_params.pop("__trigger__", None)
+            handler = signal.handler
+            name = getattr(
+                handler,
+                "__qualname__",
+                getattr(handler, "__name__", repr(handler)),
+            )
+            try:
+                maybe = handler(**call_params)
+                if isawaitable(maybe):
+                    await maybe
+            except Exception as e:
+                self.drain_coordinator.record_listener_failure(
+                    event, name, e
+                )
 
     # -------------------------------------------------------------------- #
     # Process Management

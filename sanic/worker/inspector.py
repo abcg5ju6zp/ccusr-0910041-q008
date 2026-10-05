@@ -106,6 +106,24 @@ class Inspector:
                 obj[key] = value.isoformat()
         return obj
 
+    def drain(self, trigger: bool = False) -> dict[str, Any]:
+        """本地管理接口：查询（可选触发）各 worker 的排空状态。
+
+        - 默认只返回所有 server worker 的排空快照聚合；
+        - ``trigger=True`` 时额外发送一次终止消息，作为与 SIGTERM
+          等价的停止源合并进各 worker 正在进行（或即将开始）的排空，
+          不会造成第二次排空。
+        """
+        if trigger:
+            logger.info("Triggering drain via inspector")
+            self._publisher.send("__TERMINATE__")
+
+        workers: dict[str, Any] = {}
+        for name, state in self.worker_state.items():
+            if isinstance(state, dict) and "drain" in state:
+                workers[name] = state["drain"]
+        return {"workers": workers, "count": len(workers)}
+
     def reload(self, zero_downtime: bool = False) -> None:
         """项目内部接口说明。"""
         message = "__ALL_PROCESSES__:"
