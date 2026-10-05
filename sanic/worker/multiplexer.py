@@ -64,6 +64,13 @@ class WorkerMultiplexer:
             "serving": serving,
         }
 
+    def set_drain_status(self, status: dict[str, Any]) -> None:
+        """项目内部接口说明。"""
+        self._state._state[self.name] = {
+            **self._state._state[self.name],
+            "drain": status,
+        }
+
     def exit(self):
         """项目内部接口说明。"""
         try:

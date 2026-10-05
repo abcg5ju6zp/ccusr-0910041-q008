@@ -24,6 +24,7 @@ from sanic.helpers import has_message_body
 from sanic.http.constants import Stage
 from sanic.http.stream import Stream
 from sanic.log import access_logger, error_logger, logger
+from sanic.server.drain import LeaseKind
 from sanic.touchup import TouchUpMeta
 
 
@@ -43,6 +44,7 @@ class Http(Stream, metaclass=TouchUpMeta):
     __slots__ = [
         "_send",
         "_receive_more",
+        "_drain_lease",
         "dispatch",
         "recv_buffer",
         "protocol",
@@ -71,6 +73,7 @@ class Http(Stream, metaclass=TouchUpMeta):
         self.protocol = protocol
         self.keep_alive = True
         self.stage: Stage = Stage.IDLE
+        self._drain_lease = None
         self.dispatch = self.protocol.app.dispatch
 
     def init_for_request(self):
@@ -110,6 +113,22 @@ class Http(Stream, metaclass=TouchUpMeta):
                 self.stage = Stage.HANDLER
                 self.perft0 = perf_counter()
                 self.request.conn_info = self.protocol.conn_info
+
+                drain = self.protocol.app.drain_coordinator
+                if drain.draining:
+                    # The server stopped accepting new business. Reject
+                    # late arrivals that race the drain on still-open
+                    # keep-alive connections, and close the connection so
+                    # the client retries against another worker.
+                    self.keep_alive = False
+                    raise ServiceUnavailable("Server is draining")
+                self._drain_lease = drain.acquire(
+                    LeaseKind.STREAM
+                    if self.upgrade_websocket
+                    else LeaseKind.REQUEST,
+                    name=f"{self.request.method} {self.request.path}",
+                    cancel=self.protocol.abort,
+                )
                 await self.protocol.request_handler(self.request)
 
                 # Handler finished, response should've been sent
@@ -137,6 +156,8 @@ class Http(Stream, metaclass=TouchUpMeta):
             except Exception as e:
                 # Write an error response
                 await self.error_response(e)
+            finally:
+                self._release_drain_lease()
 
             # Try to consume any remaining request body
             if self.request_body:
@@ -164,6 +185,18 @@ class Http(Stream, metaclass=TouchUpMeta):
                 self.request.stream = None
                 if self.response:
                     self.response.stream = None
+
+    def _release_drain_lease(self) -> None:
+        lease = self._drain_lease
+        if lease is not None:
+            self._drain_lease = None
+            self.protocol.app.drain_coordinator.release(lease.lease_id)
+
+    def _upgrade_drain_lease(self, kind: LeaseKind) -> None:
+        if self._drain_lease is not None:
+            self.protocol.app.drain_coordinator.upgrade(
+                self._drain_lease.lease_id, kind
+            )
 
     async def http1_request_header(self):  # no cov
         """项目内部接口说明。"""
@@ -362,6 +395,10 @@ class Http(Stream, metaclass=TouchUpMeta):
 
         await self._send(ret)
         self.stage = Stage.IDLE if end_stream else Stage.RESPONSE
+        if self.stage is Stage.RESPONSE:
+            # The handler is streaming; reclassify the lease so the
+            # drain coordinator reports the work type accurately.
+            self._upgrade_drain_lease(LeaseKind.STREAM)
 
     def head_response_ignored(self, data: bytes, end_stream: bool) -> None:
         """项目内部接口说明。"""

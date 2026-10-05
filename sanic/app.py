@@ -82,6 +82,13 @@ from sanic.models.handler_types import Sanic as SanicVar
 from sanic.request import Request
 from sanic.response import BaseHTTPResponse, HTTPResponse, ResponseStream
 from sanic.router import Router
+from sanic.server.drain import (
+    DrainClosedError,
+    DrainCoordinator,
+    DrainPolicy,
+    DrainReport,
+    LeaseKind,
+)
 from sanic.server.websockets.impl import ConnectionClosed
 from sanic.signals import Event, Signal, SignalRouter
 from sanic.touchup import TouchUp, TouchUpMeta
@@ -128,6 +135,7 @@ class Sanic(
         "_asgi_client",
         "_blueprint_order",
         "_delayed_tasks",
+        "_drain_coordinator",
         "_ext",
         "_future_commands",
         "_future_exceptions",
@@ -299,6 +307,7 @@ class Sanic(
         self._asgi_client: Any = None
         self._blueprint_order: list[Blueprint] = []
         self._delayed_tasks: list[str] = []
+        self._drain_coordinator: DrainCoordinator | None = None
         self._future_registry: FutureRegistry = FutureRegistry()
         self._inspector: Inspector | None = None
         self._manager: WorkerManager | None = None
@@ -1351,6 +1360,21 @@ class Sanic(
 
         if name and register:
             app._task_registry[name] = tsk
+            coordinator = app.drain_coordinator
+            try:
+                lease = coordinator.acquire(
+                    LeaseKind.TASK, name=name, cancel=tsk.cancel
+                )
+            except DrainClosedError:
+                logger.debug(
+                    "Task %s was registered after the drain completed; "
+                    "it will not be tracked by the drain coordinator",
+                    name,
+                )
+            else:
+                tsk.add_done_callback(
+                    lambda _: coordinator.release(lease.lease_id)
+                )
 
         return tsk
 
@@ -1482,6 +1506,50 @@ class Sanic(
             for task in iter(self._task_registry.values())
             if task is not None
         )
+
+    # -------------------------------------------------------------------- #
+    # Drain coordination
+    # -------------------------------------------------------------------- #
+
+    @property
+    def drain_coordinator(self) -> DrainCoordinator:
+        """项目内部接口说明。"""
+        if self._drain_coordinator is None:
+            self._drain_coordinator = DrainCoordinator(
+                policy=self._drain_policy(),
+                on_transition=self._publish_drain_status,
+            )
+        return self._drain_coordinator
+
+    @property
+    def drain_status(self) -> dict[str, Any]:
+        """项目内部接口说明。"""
+        return self.drain_coordinator.status()
+
+    async def drain(
+        self, timeout: float | None = None, source: str = "manual"
+    ) -> DrainReport:
+        """项目内部接口说明。"""
+        return await self.drain_coordinator.drain(
+            source=source, timeout=timeout
+        )
+
+    def _drain_policy(self) -> DrainPolicy:
+        timeout = self.config.DRAIN_TIMEOUT
+        if timeout is None:
+            timeout = self.config.GRACEFUL_SHUTDOWN_TIMEOUT
+        return DrainPolicy(
+            timeout=timeout,
+            max_extensions=self.config.DRAIN_MAX_EXTENSIONS,
+            extension_step=self.config.DRAIN_EXTENSION_STEP,
+            extension_cap=self.config.DRAIN_EXTENSION_CAP,
+            cancel_grace=self.config.DRAIN_CANCEL_GRACE,
+        )
+
+    def _publish_drain_status(self, status: dict[str, Any]) -> None:
+        if hasattr(self, "multiplexer"):
+            with suppress(Exception):
+                self.multiplexer.set_drain_status(status)
 
     # -------------------------------------------------------------------- #
     # ASGI
@@ -1697,6 +1765,8 @@ class Sanic(
 
     async def _startup(self):
         self._future_registry.clear()
+        # A fresh serving lifecycle gets a fresh drain coordinator
+        self._drain_coordinator = None
 
         if not hasattr(self, "_ext"):
             setup_ext(self)

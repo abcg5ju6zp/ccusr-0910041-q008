@@ -122,7 +122,7 @@ def _run_shutdown_coro(loop, coro):
         loop._stopping = False
 
     try:
-        loop.run_until_complete(coro())
+        return loop.run_until_complete(coro())
     except (RuntimeError, KeyboardInterrupt):
         # RuntimeError: loop was stopped (uvloop behavior)
         # KeyboardInterrupt: signal arrived during select (asyncio behavior)
@@ -131,10 +131,17 @@ def _run_shutdown_coro(loop, coro):
         if hasattr(loop, "_stopping"):
             loop._stopping = False
         try:
-            loop.run_until_complete(coro())
+            return loop.run_until_complete(coro())
         except (RuntimeError, KeyboardInterrupt):
             # If it still fails, the loop is truly unusable
             pass
+        except Exception:
+            # A failing shutdown listener must not break the lifecycle
+            error_logger.exception("Shutdown event failed")
+    except Exception:
+        # A failing shutdown listener must not break the lifecycle
+        error_logger.exception("Shutdown event failed")
+    return None
 
 
 def _run_server_forever(loop, before_stop, after_stop, cleanup, unix, pid):
@@ -153,7 +160,12 @@ def _run_server_forever(loop, before_stop, after_stop, cleanup, unix, pid):
         _run_shutdown_coro(loop, before_stop)
 
         if cleanup:
-            cleanup()
+            try:
+                cleanup()
+            except Exception:
+                # Cleanup (which drives the drain) must not prevent the
+                # after_server_stop listeners from running.
+                error_logger.exception("Server cleanup failed")
 
         _run_shutdown_coro(loop, after_stop)
 
@@ -245,17 +257,29 @@ def _serve_http_1(
         for connection in connections:
             connection.close_if_idle()
 
-        # Gracefully shutdown timeout.
-        # We should provide graceful_shutdown_timeout,
-        # instead of letting connection hangs forever.
-        # Let's roughly calcucate time.
+        # Drain in-flight work (requests, streams, background tasks)
+        # through the coordinator. Every stop source merges into this
+        # single drain, which resolves deterministically by the deadline
+        # instead of letting connections hang forever.
         graceful = app.config.GRACEFUL_SHUTDOWN_TIMEOUT
-        start_shutdown: float = 0
-        while connections and (start_shutdown < graceful):
-            loop.run_until_complete(asyncio.sleep(0.1))
-            start_shutdown = start_shutdown + 0.1
+        report = _run_shutdown_coro(
+            loop,
+            lambda: app.drain(timeout=graceful, source="server.cleanup"),
+        )
+        elapsed = report.elapsed if report else 0.0
+        if report:
+            server_logger.info(
+                "Worker drained [%s]: %s "
+                "(%d completed, %d cancelled, %d late, %.2fs)",
+                pid,
+                report.outcome,
+                report.completed,
+                len(report.cancelled),
+                report.late,
+                report.elapsed,
+            )
 
-        app.shutdown_tasks(graceful - start_shutdown)
+        app.shutdown_tasks(max(0.0, graceful - elapsed))
 
         # Force close non-idle connection after waiting for
         # graceful_shutdown_timeout

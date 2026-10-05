@@ -545,7 +545,7 @@ def test_stack_trace_on_not_found(app, static_file_directory, caplog):
     assert counter[("sanic.root", logging.INFO)] == 10
     assert counter[("sanic.root", logging.ERROR)] == 0
     assert counter[("sanic.error", logging.ERROR)] == 0
-    assert counter[("sanic.server", logging.INFO)] == 4
+    assert counter[("sanic.server", logging.INFO)] == 5
 
 
 def test_no_stack_trace_on_not_found(app, static_file_directory, caplog):
@@ -564,7 +564,7 @@ def test_no_stack_trace_on_not_found(app, static_file_directory, caplog):
     assert counter[("sanic.root", logging.INFO)] == 10
     assert counter[("sanic.root", logging.ERROR)] == 0
     assert counter[("sanic.error", logging.ERROR)] == 0
-    assert counter[("sanic.server", logging.INFO)] == 4
+    assert counter[("sanic.server", logging.INFO)] == 5
     assert response.text == "No file: /static/non_existing_file.file"
 
 

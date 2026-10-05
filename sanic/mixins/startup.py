@@ -389,6 +389,12 @@ class StartupMixin(metaclass=SanicMeta):
         """项目内部接口说明。"""
         if terminate and hasattr(self, "multiplexer"):
             self.multiplexer.terminate()
+        # Record the stop source so that every stop signal merges into
+        # the single drain executed during server cleanup. The DRAINING
+        # phase itself begins there, once the server actually stops
+        # accepting new business; work already received is allowed to
+        # finish first.
+        self.drain_coordinator.note_source("app.stop")
         if self.state.stage is not ServerStage.STOPPED:
             self.shutdown_tasks(timeout=0)  # type: ignore
             for task in all_tasks():
